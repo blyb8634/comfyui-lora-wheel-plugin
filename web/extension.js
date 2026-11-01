@@ -6,6 +6,49 @@ loadStyle();
 let pathsReady = false;
 let pathsInitialized = false;
 let pathSave = Promise.resolve();
+let siteReady = false;
+let siteInitialized = false;
+let siteSave = Promise.resolve();
+const CIVITAI_SITES = ["https://civitai.red", "https://civitai.com"];
+async function syncSite(site) {
+  const response = await api.fetchApi("/radial-lora/site", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ site }) });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+  return data;
+}
+async function showSiteInSettings(site) {
+  const manager = app.extensionManager?.setting;
+  if (!manager?.set || !site) return;
+  if (CIVITAI_SITES.includes(site)) await manager.set("RadialLoRA.Civitai.Site", site);
+  else { await manager.set("RadialLoRA.Civitai.Site", "custom"); await manager.set("RadialLoRA.Civitai.CustomSite", site); }
+}
+async function settingValue(id) {
+  try {
+    const value = await app.extensionManager?.setting?.get?.(id);
+    if (value !== undefined && value !== null) return value;
+  } catch { /* Fall back to the legacy settings API below. */ }
+  try { return app.ui?.settings?.getSettingValue?.(id); } catch { return undefined; }
+}
+async function applySiteChange() {
+  if (!siteReady) {
+    if (siteInitialized) app.extensionManager?.toast?.add?.({ severity: 'warn', summary: '请先重启 ComfyUI', detail: 'Civitai 站点接口尚未加载；此修改尚未应用。', life: 8000 });
+    return;
+  }
+  const preset = await settingValue("RadialLoRA.Civitai.Site");
+  const custom = await settingValue("RadialLoRA.Civitai.CustomSite");
+  const site = preset === "custom" ? String(custom ?? "").trim().replace(/\/+$/, "") : String(preset ?? "");
+  if (!site) return; // 选择“自定义”但尚未填写地址时等待后续输入
+  siteSave = siteSave.then(() => syncSite(site)).catch(async error => {
+    app.extensionManager?.toast?.add?.({ severity: 'error', summary: 'Civitai 站点未保存', detail: error.message, life: 8000 });
+    const response = await api.fetchApi('/radial-lora/site');
+    if (response.ok) {
+      siteReady = false;
+      siteInitialized = false;
+      try { await showSiteInSettings((await response.json()).site); }
+      finally { siteReady = true; siteInitialized = true; }
+    }
+  });
+}
 async function syncPaths(value) {
   const extra_paths = String(value ?? "").split(/[|\n]/).map(path => path.trim()).filter(Boolean);
   const response = await api.fetchApi("/radial-lora/paths", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ extra_paths }) });
@@ -24,6 +67,13 @@ app.registerExtension({
       pathsReady = true;
     } catch (error) { console.warn('[Radial LoRA]', error.message); }
     finally { pathsInitialized = true; }
+    try {
+      const response = await api.fetchApi('/radial-lora/site');
+      if (!response.ok) throw new Error('请重启 ComfyUI 以加载 Civitai 站点接口');
+      await showSiteInSettings((await response.json()).site);
+      siteReady = true;
+    } catch (error) { console.warn('[Radial LoRA]', error.message); }
+    finally { siteInitialized = true; }
   },
   settings: [
     { id: "RadialLoRA.Library.ExtraPaths", name: "额外 LoRA 目录（多个用 | 分隔）", category: ["LoRA 轮盘", "模型库", "额外 LoRA 目录"], type: "text", defaultValue: "", tooltip: "填写服务器上的绝对路径，如 D:\\LoRA | E:\\Models\\LoRA。留空仍使用 ComfyUI 默认及已配置的路径；只追加，不替换。目录为同一 ComfyUI 服务共享，同名相对路径优先使用原有模型。", onChange: value => {
@@ -43,6 +93,8 @@ app.registerExtension({
         }
       });
     } },
+    { id: "RadialLoRA.Civitai.Site", name: "Civitai 站点", category: ["LoRA 轮盘", "在线资料", "Civitai 站点"], type: "combo", defaultValue: "https://civitai.red", options: [{ text: "civitai.red（镜像）", value: "https://civitai.red" }, { text: "civitai.com（官方）", value: "https://civitai.com" }, { text: "自定义（配合下方地址）", value: "custom" }], tooltip: "LoRA 资料查询与发布页链接使用的 Civitai 站点，默认镜像 civitai.red；切换后立即生效，已缓存结果的链接自动跟随。选“自定义”时须在“自定义 Civitai 站点地址”填写完整地址。", onChange: () => applySiteChange() },
+    { id: "RadialLoRA.Civitai.CustomSite", name: "自定义 Civitai 站点地址", category: ["LoRA 轮盘", "在线资料", "自定义 Civitai 站点地址"], type: "text", defaultValue: "", tooltip: "仅当“Civitai 站点”选择“自定义”时生效。填写完整地址，如 https://civitai.example.com；本机代理可用 http://127.0.0.1:8000。", onChange: () => applySiteChange() },
     { id: "RadialLoRA.Appearance.Transparency", name: "背景透明度", category: ["LoRA 轮盘", "外观", "背景透明度"], type: "slider", defaultValue: 100, attrs: { min: 0, max: 100, step: 1 }, tooltip: "0 为不透明，100 为全透明。只影响轮盘外围背景，不影响封面和文字。", onChange: value => updateAppearance({ transparency: value }) },
     { id: "RadialLoRA.Appearance.CoverMode", name: "饼状图封面", category: ["LoRA 轮盘", "外观", "饼状图封面"], type: "combo", defaultValue: "contain", options: [{ text: "缩小（完整显示）", value: "contain" }, { text: "填充（铺满扇区）", value: "fill" }], onChange: value => updateAppearance({ coverMode: value }) },
     { id: "RadialLoRA.Appearance.Sectors", name: "轮盘扇区数量", category: ["LoRA 轮盘", "外观", "轮盘扇区数量"], type: "slider", defaultValue: 6, attrs: { min: 4, max: 10, step: 1 }, tooltip: "每页均分为 4–10 个扇区，默认 6；数量越多，封面和名称越紧凑。", onChange: value => updateAppearance({ sectors: value }) },

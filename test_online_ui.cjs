@@ -49,10 +49,10 @@ const assert = require('node:assert/strict');
         if (mode === 'absent') return route.fulfill({ status: 404, body: 'not found' });
         data = mode === 'missing' ? { found: false, message: '未找到公开版本' } : {
           found: true, model_id: 42, model_name: 'Fixture', description: 'Overall model intro', matched_version_id: 7,
-          creator: 'Example', versions: [
-            { id: 7, name: 'local version', base_model: 'Anima', trigger_words: ['flat color, no lineart'], description: '<img src=x onerror=alert(1)>', images: [{ url: 'https://image.civitai.com/one.png', prompt: 'portrait, vivid colors' }, { url: 'https://image.civitai.com/two.png', prompt: '' }] },
-            { id: 8, name: 'other version', base_model: 'Other', trigger_words: ['other'], description: 'Other description', images: [{ url: 'https://image.civitai.com/three.png', prompt: 'alternate' }] },
-            { id: 9, name: 'no notes', base_model: 'Other', trigger_words: [], description: '', images: [] },
+          creator: 'Example', url: 'https://mirror.example/models/42?modelVersionId=7', versions: [
+            { id: 7, name: 'local version', base_model: 'Anima', trigger_words: ['flat color, no lineart'], description: '<img src=x onerror=alert(1)>', url: 'https://mirror.example/models/42?modelVersionId=7', images: [{ url: 'https://image.civitai.com/one.png', prompt: 'portrait, vivid colors' }, { url: 'https://image.civitai.com/two.png', prompt: '' }] },
+            { id: 8, name: 'other version', base_model: 'Other', trigger_words: ['other'], description: 'Other description', url: 'https://mirror.example/models/42?modelVersionId=8', images: [{ url: 'https://image.civitai.com/three.png', prompt: 'alternate' }] },
+            { id: 9, name: 'no notes', base_model: 'Other', trigger_words: [], description: '', url: 'https://mirror.example/models/42?modelVersionId=9', images: [] },
           ],
         };
       }
@@ -129,7 +129,7 @@ const assert = require('node:assert/strict');
     assert.equal(await page.evaluate(() => window.translationCalls[0].targetLanguage), 'zh');
     assert.match(await page.locator('.rl-gallery-label').innerText(), /本地封面 · 1 \/ 2/);
     assert.equal(await page.evaluate(() => window.selection), '[]');
-    assert.match(await page.locator('.rl-model-title a').getAttribute('href'), /modelVersionId=8$/);
+    assert.equal(await page.locator('.rl-model-title a').getAttribute('href'), 'https://mirror.example/models/42?modelVersionId=8', 'page link must come from the backend URL, not a hardcoded domain');
     await page.getByLabel('查看 Civitai 版本', { exact: true }).selectOption('9');
     assert.equal(await page.locator('.rl-description h4').innerText(), '模型介绍');
     assert.equal(await page.locator('.rl-online-description').innerText(), 'Overall model intro');

@@ -237,8 +237,10 @@ export async function openWheel({ getValue, setValue, getLayout = () => ({}), se
     const version = data?.versions?.find(value => value.id === (state.version || data.matched_version_id)) || data?.versions?.[0];
     const title = el('h3', 'rl-model-title');
     const link = el('a', '', data?.model_name || item.title);
-    if (Number.isSafeInteger(data?.model_id) && Number.isSafeInteger(version?.id)) {
-      link.href = `https://civitai.com/models/${data.model_id}?modelVersionId=${version.id}`;
+    // The backend supplies the page URL so the configured site stays the single source of truth.
+    const modelPage = version?.url || data?.url;
+    if (Number.isSafeInteger(data?.model_id) && Number.isSafeInteger(version?.id) && typeof modelPage === 'string' && /^https?:\/\//.test(modelPage)) {
+      link.href = modelPage;
       link.target = '_blank'; link.rel = 'noopener noreferrer';
       link.append(el('span', '', ' ↗'));
     }

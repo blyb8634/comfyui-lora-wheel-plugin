@@ -7,6 +7,7 @@ import logging
 import os
 import struct
 import tempfile
+import time
 import warnings
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -23,12 +24,18 @@ WEB_DIRECTORY = "./web"
 MAX_JSON = 8 * 1024 * 1024
 IMAGE_TYPES = {".png", ".jpg", ".jpeg", ".webp"}
 PATH_CONFIG = Path(folder_paths.get_system_user_directory("radial_lora")) / "paths.json"
+SITE_CONFIG = PATH_CONFIG.parent / "site.json"
 _owned_paths = []
 _extra_paths = []
 _path_lock = asyncio.Lock()
-_thumbnail_lock = asyncio.Lock()
+_thumbnail_slots = asyncio.Semaphore(3)
 MAX_COVER_BYTES = 256 * 1024 * 1024
 MAX_COVER_PIXELS = 180_000_000
+MAX_COVER_CACHE_BYTES = 512 * 1024 * 1024
+MAX_COVER_CACHE_FILES = 4000
+MAX_LOOKUP_CACHE_BYTES = 64 * 1024 * 1024
+MAX_LOOKUP_CACHE_FILES = 3000
+_last_sweep = 0.0
 
 
 def validate_paths(paths, require_exists=True):
@@ -83,10 +90,21 @@ if PATH_CONFIG.is_file():
     except (OSError, ValueError, KeyError) as error:
         logging.warning("[Radial LoRA] Cannot load extra directories: %s", error)
 
+if SITE_CONFIG.is_file():
+    try:
+        civitai.set_site(json.loads(SITE_CONFIG.read_text(encoding="utf-8"))["site"])
+    except (OSError, ValueError, KeyError) as error:
+        logging.warning("[Radial LoRA] Cannot load Civitai site: %s", error)
+
 
 @PromptServer.instance.routes.get("/radial-lora/paths")
 async def get_paths(request):
     return web.json_response(path_state())
+
+
+@PromptServer.instance.routes.get("/radial-lora/site")
+async def get_site(request):
+    return web.json_response({"site": civitai.site()})
 
 
 def require_same_origin(request):
@@ -114,6 +132,33 @@ async def set_paths(request):
             return web.json_response({"error": str(error)}, status=400)
 
 
+@PromptServer.instance.routes.post("/radial-lora/site")
+async def set_site(request):
+    require_same_origin(request)
+    if request.content_type != "application/json":
+        raise web.HTTPUnsupportedMediaType()
+    try:
+        data = await request.json()
+        civitai.set_site(data.get("site") if isinstance(data, dict) else None)
+    except ValueError as error:
+        return web.json_response({"error": str(error)}, status=400)
+    warning = ""
+    try:
+        SITE_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=SITE_CONFIG.parent, suffix=".tmp", delete=False) as stream:
+                temporary = stream.name
+                json.dump({"site": civitai.site()}, stream, ensure_ascii=False, indent=2)
+            os.replace(temporary, SITE_CONFIG)
+        finally:
+            if temporary and os.path.exists(temporary):
+                os.unlink(temporary)
+    except OSError:
+        warning = "已应用于本次运行，但配置写入失败，重启后将恢复默认站点。"
+    return web.json_response({"site": civitai.site(), "warning": warning})
+
+
 def lora_path(name):
     # Only names enumerated by ComfyUI are accepted, never arbitrary client paths.
     if not isinstance(name, str) or name not in folder_paths.get_filename_list("loras"):
@@ -131,16 +176,68 @@ def read_json(path):
     return {}
 
 
+_cover_listing = {}
+
+
+def directory_images(directory):
+    """List usable local images per directory, cached until the directory changes."""
+    root = directory.resolve()
+    try:
+        stamp = root.stat().st_mtime_ns
+    except OSError:
+        return []
+    cached = _cover_listing.get(root)
+    if cached and cached[0] == stamp:
+        return cached[1]
+    try:
+        images = [item for item in root.iterdir() if item.suffix.lower() in IMAGE_TYPES and item.is_file() and item.resolve().parent == root]
+    except OSError:
+        return []
+    _cover_listing[root] = (stamp, images)
+    return images
+
+
 def covers(path):
     # Local adjacent artwork only; no remote fetching or writes to the model library.
-    candidates = []
-    for item in path.parent.iterdir():
-        if item.suffix.lower() not in IMAGE_TYPES or not item.is_file():
-            continue
-        if item.stem == path.stem or item.name.startswith(path.stem + "."):
-            if item.resolve().parent == path.parent.resolve():
-                candidates.append(item)
-    return sorted(candidates, key=lambda p: p.name.casefold())
+    return sorted((item for item in directory_images(path.parent) if item.stem == path.stem or item.name.startswith(path.stem + ".")), key=lambda p: p.name.casefold())
+
+
+def trim_cache(directory, max_bytes, max_files):
+    """Delete the oldest files in a cache directory until it fits its budget."""
+    entries = []
+    total = 0
+    try:
+        for item in directory.iterdir():
+            if not item.is_file():
+                continue
+            stat = item.stat()
+            entries.append((stat.st_mtime_ns, stat.st_size, item))
+            total += stat.st_size
+    except OSError:
+        return
+    if len(entries) <= max_files and total <= max_bytes:
+        return
+    entries.sort(key=lambda entry: entry[0])
+    for index, (_, size, item) in enumerate(entries):
+        if len(entries) - index <= max_files and total <= max_bytes:
+            break
+        try:
+            item.unlink()
+            total -= size
+        except OSError:
+            pass
+
+
+def sweep_caches():
+    """Trim thumbnail and lookup caches, at most once every ten minutes."""
+    global _last_sweep
+    now = time.monotonic()
+    if now - _last_sweep < 600:
+        return
+    _last_sweep = now
+    base = PATH_CONFIG.parent
+    trim_cache(base / "covers", MAX_COVER_CACHE_BYTES, MAX_COVER_CACHE_FILES)
+    trim_cache(base / "civitai", MAX_LOOKUP_CACHE_BYTES, MAX_LOOKUP_CACHE_FILES)
 
 
 def cover_thumbnail(source):
@@ -153,6 +250,7 @@ def cover_thumbnail(source):
     if target.is_file():
         return target
     target.parent.mkdir(parents=True, exist_ok=True)
+    sweep_caches()
     temporary = None
     try:
         # Pillow warns above its default pixel threshold; our explicit limit handles it.
@@ -218,16 +316,10 @@ def metadata(path):
 
 def catalogue():
     result = []
-    images_by_dir = {}
     for name in folder_paths.get_filename_list("loras"):
         try:
             path = Path(folder_paths.get_full_path_or_raise("loras", name))
-            parent = path.parent
-            if parent not in images_by_dir:
-                root = parent.resolve()
-                images_by_dir[parent] = [item for item in parent.iterdir() if item.suffix.lower() in IMAGE_TYPES and item.is_file() and item.resolve().parent == root]
-            count = sum(item.stem == path.stem or item.name.startswith(path.stem + ".") for item in images_by_dir[parent])
-            result.append({"name": name, "title": path.stem, "cover_count": count, "size_bytes": path.stat().st_size})
+            result.append({"name": name, "title": path.stem, "cover_count": len(covers(path)), "size_bytes": path.stat().st_size})
         except (OSError, ValueError):
             continue
     return result
@@ -248,8 +340,7 @@ async def identify_civitai(request):
         if not isinstance(data, dict) or type(data.get("refresh", False)) is not bool:
             raise ValueError("查询参数无效")
         path = lora_path(data.get("name"))
-        async with asyncio.timeout(90):
-            result = await civitai.lookup(path, PATH_CONFIG.parent / "civitai", data.get("refresh", False))
+        result = await asyncio.wait_for(civitai.lookup(path, PATH_CONFIG.parent / "civitai", data.get("refresh", False)), 90)
         return web.json_response(result)
     except civitai.LookupError as error:
         return web.json_response({"error": str(error), "code": error.code}, status=error.status)
@@ -331,7 +422,7 @@ async def get_thumbnail(request):
     except (ValueError, OSError):
         raise web.HTTPNotFound()
     try:
-        async with _thumbnail_lock:
+        async with _thumbnail_slots:
             preview = await asyncio.to_thread(cover_thumbnail, source)
         return web.FileResponse(preview, headers={"X-Content-Type-Options": "nosniff", "Content-Type": "image/webp"})
     except (ValueError, OSError) as error:

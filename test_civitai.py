@@ -12,6 +12,7 @@ import civitai
 class TestCivitai(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         civitai.RATE_LIMIT_UNTIL = 0
+        civitai.set_site(civitai.DEFAULT_SITE)
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)
         self.model = self.root / "model.safetensors"
@@ -78,6 +79,7 @@ class TestCivitai(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["versions"][0]["description"], "Hello world")
         self.assertEqual(result["versions"][0]["trigger_words"], ["trigger"])
         self.assertEqual(result["creator"], "Example")
+        self.assertEqual(result["url"], "https://civitai.red/models/42?modelVersionId=7")
         self.assertEqual(result["versions"][0]["images"], [{"url": "https://image.civitai.com/safe.png", "prompt": "<lora:style:0.8>, vivid", "negative_prompt": "blur"}])
         self.assertEqual(mocked.await_count, 2)
 
@@ -211,6 +213,71 @@ class TestCivitai(unittest.IsolatedAsyncioTestCase):
         fallback, fetch = await self.lookup([version, offline], refresh=True)
         self.assertEqual(fallback, {**first, "cached": True})
         self.assertEqual(fetch.await_count, 2)
+
+    async def test_set_site_validates_address(self):
+        for invalid in ["", "not a url", "ftp://civitai.red", "http://civitai.red", "https://user:pass@civitai.red", "https://civitai.red?q=1", 123, None]:
+            with self.assertRaises(ValueError):
+                civitai.set_site(invalid)
+        civitai.set_site("http://127.0.0.1:8000/")
+        self.assertEqual(civitai.site(), "http://127.0.0.1:8000")
+        civitai.set_site(" https://civitai.com/ ")
+        self.assertEqual(civitai.site(), "https://civitai.com")
+        civitai.set_site(civitai.DEFAULT_SITE)
+
+    async def test_urls_follow_configured_site(self):
+        civitai.set_site("https://civitai.com")
+        try:
+            version = {"id": 7, "modelId": 42, "name": "Version", "trainedWords": []}
+            model = {"id": 42, "name": "Model", "description": ""}
+            result, _ = await self.lookup([version, model])
+            self.assertEqual(result["url"], "https://civitai.com/models/42?modelVersionId=7")
+            self.assertEqual(result["versions"][0]["url"], "https://civitai.com/models/42?modelVersionId=7")
+        finally:
+            civitai.set_site(civitai.DEFAULT_SITE)
+
+    async def test_cached_urls_follow_site_switch(self):
+        version = {"id": 7, "modelId": 42, "name": "Version", "trainedWords": []}
+        model = {"id": 42, "name": "Model", "description": ""}
+        first, _ = await self.lookup([version, model])
+        self.assertEqual(first["url"], "https://civitai.red/models/42?modelVersionId=7")
+        civitai.set_site("https://civitai.com")
+        try:
+            with patch.object(civitai, "fetch_json", new=AsyncMock(return_value=None)) as fetch:
+                second = await civitai.lookup(self.model, self.cache)
+            self.assertTrue(second["cached"])
+            self.assertEqual(fetch.await_count, 0)
+            self.assertEqual(second["url"], "https://civitai.com/models/42?modelVersionId=7")
+            self.assertEqual(second["versions"][0]["url"], "https://civitai.com/models/42?modelVersionId=7")
+        finally:
+            civitai.set_site(civitai.DEFAULT_SITE)
+
+    async def test_sidecar_hash_skips_full_read(self):
+        digest = hashlib.sha256(self.model.read_bytes()).hexdigest()
+        info = {"modelVersions": [{"files": [{"name": self.model.name, "hashes": {"SHA256": digest.upper()}, "sizeKB": self.model.stat().st_size / 1024}]}]}
+        self.model.with_suffix(".civitai.info").write_text(json.dumps(info), encoding="utf-8")
+        version = {"id": 7, "modelId": 42, "name": "Version", "trainedWords": []}
+        model = {"id": 42, "name": "Model", "description": ""}
+        with patch.object(civitai, "fingerprint", side_effect=AssertionError("sidecar hash should be reused")):
+            result, mocked = await self.lookup([version, model])
+        self.assertEqual(result["sha256"], digest)
+        self.assertEqual(mocked.await_args_list[0].args[1], "model-versions/by-hash/" + digest)
+        self.assertEqual(mocked.await_count, 2)
+
+    async def test_sidecar_hash_falls_back_when_not_indexed(self):
+        digest = hashlib.sha256(self.model.read_bytes()).hexdigest()
+        info = {"modelVersions": [{"files": [{"name": self.model.name, "hashes": {"SHA256": "0" * 64}, "sizeKB": self.model.stat().st_size / 1024}]}]}
+        self.model.with_suffix(".civitai.info").write_text(json.dumps(info), encoding="utf-8")
+        result, mocked = await self.lookup([None, None])
+        self.assertEqual(result["sha256"], digest)
+        self.assertEqual([entry.args[1] for entry in mocked.await_args_list], ["model-versions/by-hash/" + "0" * 64, "model-versions/by-hash/" + digest])
+
+    async def test_stale_sidecar_size_is_ignored(self):
+        digest = hashlib.sha256(self.model.read_bytes()).hexdigest()
+        info = {"modelVersions": [{"files": [{"name": self.model.name, "hashes": {"SHA256": "1" * 64}, "sizeKB": 999999}]}]}
+        self.model.with_suffix(".civitai.info").write_text(json.dumps(info), encoding="utf-8")
+        result, mocked = await self.lookup([None])
+        self.assertEqual(result["sha256"], digest)
+        mocked.assert_awaited_once_with(ANY, "model-versions/by-hash/" + digest)
 
 
 class TestFetchJson(unittest.IsolatedAsyncioTestCase):

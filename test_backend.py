@@ -111,9 +111,29 @@ class BackendTest(unittest.TestCase):
 
     def test_mutating_routes_require_origin(self):
         request = types.SimpleNamespace(headers={}, host='localhost:8188')
-        for route in (radial.set_paths, radial.identify_civitai, radial.translate_description):
+        for route in (radial.set_paths, radial.set_site, radial.identify_civitai, radial.translate_description):
             with self.subTest(route=route.__name__), self.assertRaises(radial.web.HTTPForbidden):
                 asyncio.run(route(request))
+
+    def test_site_route_roundtrip(self):
+        request = types.SimpleNamespace(headers={'Origin': 'http://localhost:8188'}, host='localhost:8188', content_type='application/json', json=AsyncMock(return_value={'site': 'https://civitai.example'}))
+        with tempfile.TemporaryDirectory() as tmp, patch.object(radial, 'SITE_CONFIG', Path(tmp) / 'site.json'):
+            try:
+                self.assertEqual(json.loads(asyncio.run(radial.get_site(types.SimpleNamespace())).text)['site'], radial.civitai.DEFAULT_SITE)
+                response = asyncio.run(radial.set_site(request))
+                self.assertEqual(response.status, 200)
+                self.assertEqual(json.loads(response.text)['site'], 'https://civitai.example')
+                self.assertEqual(json.loads(radial.SITE_CONFIG.read_text(encoding='utf-8'))['site'], 'https://civitai.example')
+                request.json = AsyncMock(return_value={'site': 'http://not-local.example'})
+                self.assertEqual(asyncio.run(radial.set_site(request)).status, 400)
+                request.json = AsyncMock(return_value={'site': 'http://127.0.0.1:8000'})
+                self.assertEqual(asyncio.run(radial.set_site(request)).status, 200)
+                request.json = AsyncMock(return_value={})
+                self.assertEqual(asyncio.run(radial.set_site(request)).status, 400)
+                request.headers['Origin'] = 'http://untrusted.example'
+                with self.assertRaises(radial.web.HTTPForbidden): asyncio.run(radial.set_site(request))
+            finally:
+                radial.civitai.set_site(radial.civitai.DEFAULT_SITE)
 
     def test_extra_paths_preserve_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -151,6 +171,16 @@ class BackendTest(unittest.TestCase):
                 radial.apply_paths([], persist=True)
             finally:
                 radial.PATH_CONFIG = original_config
+
+    def test_cache_trim_keeps_newest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            for index in range(5):
+                item = directory / f"{index}.webp"
+                item.write_bytes(b"x" * 10)
+                os.utime(item, (index + 1, index + 1))
+            radial.trim_cache(directory, 10 ** 9, 2)
+            self.assertEqual([item.name for item in sorted(directory.iterdir())], ["3.webp", "4.webp"])
 
     def test_selection_and_native_chain(self):
         folder.get_filename_list = lambda _: ["a.safetensors", "b.safetensors"]

@@ -12,11 +12,39 @@ from weakref import WeakKeyDictionary
 
 import aiohttp
 
-API = "https://civitai.com/api/v1/"
+DEFAULT_SITE = "https://civitai.red"
+_site = DEFAULT_SITE
 MAX_RESPONSE = 4 * 1024 * 1024
 LOOKUP_STATES = WeakKeyDictionary()
 RATE_LIMIT_UNTIL = 0.0
 RATE_LIMIT_SECONDS = 30
+
+
+def set_site(value):
+    """Validate and switch the Civitai-compatible site used for pages and API calls."""
+    global _site
+    if not isinstance(value, str):
+        raise ValueError("Civitai 站点必须是字符串")
+    value = value.strip().rstrip("/")
+    try:
+        parsed = urlsplit(value)
+        _ = parsed.port
+    except ValueError as error:
+        raise ValueError("Civitai 站点地址无效") from error
+    if not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("Civitai 站点地址无效")
+    local = parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+    if parsed.scheme not in ("https", "http") or (parsed.scheme == "http" and not local):
+        raise ValueError("Civitai 站点须使用完整的 HTTPS 地址，例如 https://civitai.red；本机代理可用 http://127.0.0.1")
+    _site = value
+
+
+def site():
+    return _site
+
+
+def api(route):
+    return f"{site()}/api/v1/{route}"
 
 
 class LookupError(Exception):
@@ -56,15 +84,60 @@ def signature(path):
     return [stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns]
 
 
+def file_sha256(stream):
+    if hasattr(hashlib, "file_digest"):
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+    digest = hashlib.sha256()
+    for block in iter(lambda: stream.read(1024 * 1024), b""):
+        digest.update(block)
+    return digest.hexdigest()
+
+
 def fingerprint(path):
     before = signature(path)
-    digest = hashlib.sha256()
     with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
+        digest = file_sha256(stream)
     if signature(path) != before:
         raise LookupError("模型文件正在变化，请等文件写入完成后重试", 409, "file_changed")
-    return before, digest.hexdigest()
+    return before, digest
+
+
+def sidecar_digest(path, size):
+    """Reuse the SHA-256 recorded in a neighbouring .civitai.info file.
+
+    Only trusted when the recorded size matches the local file, so a stale
+    sidecar cannot silently point at the wrong Civitai version.
+    """
+    try:
+        info = json.loads(path.with_suffix(".civitai.info").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(info, dict):
+        return ""
+    files = []
+    for version in info.get("modelVersions") if isinstance(info.get("modelVersions"), list) else []:
+        if isinstance(version, dict) and isinstance(version.get("files"), list):
+            files.extend(version["files"])
+    if isinstance(info.get("files"), list):
+        files.extend(info["files"])
+    own, matches, others = path.name.casefold(), [], []
+    for item in files:
+        if not isinstance(item, dict):
+            continue
+        hashes = item.get("hashes")
+        value = hashes.get("SHA256") if isinstance(hashes, dict) else None
+        if not isinstance(value, str):
+            continue
+        value = value.strip().lower()
+        if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+            continue
+        recorded = item.get("sizeKB")
+        if isinstance(recorded, (int, float)) and not isinstance(recorded, bool) and abs(size - int(recorded * 1024)) > 4096:
+            continue
+        name = item.get("name")
+        (matches if isinstance(name, str) and name.casefold() == own else others).append(value)
+    values = matches or others
+    return values[0] if len(set(values)) == 1 else ""
 
 
 def read_cache(path):
@@ -92,7 +165,7 @@ def write_cache(path, value):
 
 async def fetch_json(session, route):
     try:
-        async with session.get(API + route, allow_redirects=False) as response:
+        async with session.get(api(route), allow_redirects=False) as response:
             if response.status == 404:
                 return None
             if response.status in (401, 403):
@@ -150,8 +223,27 @@ def version_info(data, model_id):
         "trigger_words": [text(word, 500) for word in words[:64] if isinstance(word, str)] if isinstance(words, list) else [],
         "published_at": text(data.get("publishedAt"), 40),
         "images": images,
-        "url": f"https://civitai.com/models/{model_id}?modelVersionId={version_id}",
+        "url": f"{site()}/models/{model_id}?modelVersionId={version_id}",
     }
+
+
+def resite(value):
+    """Point a stored model-page URL at the currently configured site."""
+    if not isinstance(value, str):
+        return value
+    marker = "/models/"
+    index = value.find(marker)
+    return site() + value[index:] if index >= 0 else value
+
+
+def resited(result):
+    """Rewrite cached model-page URLs so switching sites also fixes old caches."""
+    if not isinstance(result, dict) or not result.get("found"):
+        return result
+    versions = result.get("versions")
+    if isinstance(versions, list):
+        versions = [{**item, "url": resite(item.get("url"))} if isinstance(item, dict) else item for item in versions]
+    return {**result, "url": resite(result.get("url")), "versions": versions}
 
 
 async def _lookup(path, cache_path, refresh, limit):
@@ -160,7 +252,7 @@ async def _lookup(path, cache_path, refresh, limit):
         cached = await asyncio.to_thread(read_cache, cache_path)
         digest = cached.get("sha256", "")
         same_file = cached.get("signature") == stamp and isinstance(digest, str) and len(digest) == 64 and all(char in "0123456789abcdef" for char in digest)
-        result = cached.get("result")
+        result = resited(cached.get("result"))
         ttl = 86400 if isinstance(result, dict) and result.get("found") else 3600
         fetched = cached.get("fetched_at")
         stale = {**result, "cached": True, "fetched_at": fetched} if same_file and isinstance(result, dict) and isinstance(fetched, (int, float)) else None
@@ -171,7 +263,13 @@ async def _lookup(path, cache_path, refresh, limit):
                 return stale
             raise LookupError("Civitai 请求过于频繁，请稍后重试", 429, "rate_limited")
         if not same_file:
-            stamp, digest = await asyncio.to_thread(fingerprint, path)
+            stamp = signature(path)
+            digest = await asyncio.to_thread(sidecar_digest, path, stamp[0])
+            sidecar = bool(digest)
+            if not sidecar:
+                stamp, digest = await asyncio.to_thread(fingerprint, path)
+        else:
+            sidecar = False
         timeout = aiohttp.ClientTimeout(total=25, connect=10)
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True, headers={"Accept": "application/json", "User-Agent": "ComfyUI-Radial-LoRA/0.1"}) as session:
             async def get(route):
@@ -185,6 +283,11 @@ async def _lookup(path, cache_path, refresh, limit):
 
             try:
                 version = await get("model-versions/by-hash/" + digest)
+                if version is None and sidecar:
+                    # The sidecar hash is not indexed (or is stale): hash the file itself.
+                    sidecar = False
+                    stamp, digest = await asyncio.to_thread(fingerprint, path)
+                    version = await get("model-versions/by-hash/" + digest)
             except LookupError as error:
                 if stale is not None and error.status in (429, 502, 504) and signature(path) == stamp:
                     return stale
